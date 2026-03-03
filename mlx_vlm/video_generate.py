@@ -5,6 +5,7 @@ import base64
 import logging
 import math
 import os
+import subprocess
 import time
 from io import BytesIO
 from typing import List
@@ -187,14 +188,182 @@ def smart_nframes(
     return nframes
 
 
+def extract_keyframes(video_path: str, video_fps: float) -> list[int]:
+    """Extract I-frame (keyframe) indices from a video using ffprobe.
+
+    Returns a list of frame indices corresponding to keyframes, or an empty
+    list if ffprobe is unavailable or fails.
+    """
+    try:
+        result = subprocess.run(
+            [
+                "ffprobe",
+                "-select_streams",
+                "v:0",
+                "-show_packets",
+                "-print_format",
+                "csv",
+                "-show_entries",
+                "packet=pts_time,flags",
+                video_path,
+            ],
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        if result.returncode != 0:
+            logger.warning(f"ffprobe failed (rc={result.returncode}), skipping keyframes")
+            return []
+
+        indices = []
+        for line in result.stdout.strip().splitlines():
+            # Format: packet,<pts_time>,<flags>
+            parts = line.split(",")
+            if len(parts) < 3:
+                continue
+            if parts[0] != "packet":
+                continue
+            pts_time_str, flags = parts[1], parts[2]
+            if "K" not in flags:
+                continue
+            try:
+                pts_time = float(pts_time_str)
+            except (ValueError, TypeError):
+                continue
+            frame_idx = int(round(pts_time * video_fps))
+            indices.append(frame_idx)
+
+        logger.info(f"extract_keyframes: found {len(indices)} keyframes")
+        return indices
+    except FileNotFoundError:
+        logger.warning("ffprobe not found, skipping keyframe extraction")
+        return []
+    except subprocess.TimeoutExpired:
+        logger.warning("ffprobe timed out, skipping keyframe extraction")
+        return []
+    except Exception:
+        logger.warning("ffprobe error, skipping keyframe extraction")
+        return []
+
+
+def extract_audio_transcript(
+    video_path: str,
+    frame_indices: list[int],
+    video_fps: float,
+) -> str | None:
+    """Extract audio transcript with timestamps aligned to sampled frames.
+
+    Uses mlx-whisper to transcribe the audio track, then tags each transcript
+    segment with the nearest frame index. Returns a formatted string to embed
+    in the prompt, or None if transcription fails.
+    """
+    try:
+        import mlx_whisper
+    except ImportError:
+        logger.warning("mlx-whisper not installed, skipping audio transcription")
+        return None
+
+    import tempfile
+
+    # Extract audio to a temp WAV file
+    wav_path = None
+    try:
+        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f:
+            wav_path = f.name
+        result = subprocess.run(
+            [
+                "ffmpeg", "-y", "-i", video_path,
+                "-vn", "-acodec", "pcm_s16le", "-ar", "16000", "-ac", "1",
+                wav_path,
+            ],
+            capture_output=True,
+            timeout=60,
+        )
+        if result.returncode != 0:
+            logger.warning("ffmpeg audio extraction failed")
+            return None
+
+        # Transcribe with word-level timestamps
+        logger.info("Transcribing audio with mlx-whisper...")
+        transcript = mlx_whisper.transcribe(
+            wav_path,
+            path_or_hf_repo="mlx-community/whisper-large-v3-turbo",
+            word_timestamps=True,
+        )
+
+        if not transcript or not transcript.get("segments"):
+            logger.info("No speech detected in audio")
+            return None
+
+        # Convert frame indices to timestamps
+        frame_times = [idx / video_fps for idx in frame_indices]
+
+        def nearest_frame(t: float) -> int:
+            """Find the nearest frame index for a given timestamp."""
+            best_i = 0
+            best_dist = abs(frame_times[0] - t)
+            for i, ft in enumerate(frame_times):
+                d = abs(ft - t)
+                if d < best_dist:
+                    best_dist = d
+                    best_i = i
+            return best_i
+
+        # Build transcript lines tagged with frame numbers
+        lines = []
+        for seg in transcript["segments"]:
+            start_t = seg["start"]
+            end_t = seg["end"]
+            text = seg["text"].strip()
+            if not text:
+                continue
+            f_start = nearest_frame(start_t)
+            f_end = nearest_frame(end_t)
+            mm_s = int(start_t) // 60
+            ss_s = int(start_t) % 60
+            mm_e = int(end_t) // 60
+            ss_e = int(end_t) % 60
+            if f_start == f_end:
+                lines.append(f"[{mm_s}:{ss_s:02d}-{mm_e}:{ss_e:02d}, frame {f_start}] {text}")
+            else:
+                lines.append(f"[{mm_s}:{ss_s:02d}-{mm_e}:{ss_e:02d}, frames {f_start}-{f_end}] {text}")
+
+        if not lines:
+            return None
+
+        logger.info(f"Transcribed {len(lines)} segments")
+        return "\n".join(lines)
+
+    except FileNotFoundError:
+        logger.warning("ffmpeg not found, skipping audio transcription")
+        return None
+    except Exception as e:
+        logger.warning(f"Audio transcription failed: {e}")
+        return None
+    finally:
+        if wav_path:
+            try:
+                os.unlink(wav_path)
+            except OSError:
+                pass
+
+
 def load_video(
     ele: dict,
-) -> (np.ndarray, float):
+    use_keyframes: bool = False,
+) -> tuple[np.ndarray, float, list[int], int, float]:
     """
     Read video using cv2.VideoCapture.
 
     The video is read as a NumPy array with shape (T, C, H, W) where T is the number of frames,
     C is the number of channels, and H, W are the frame dimensions.
+
+    Returns:
+        video_np: Array of shape (T, C, H, W)
+        sample_fps: Effective sampling fps
+        frame_indices: List of frame indices that were sampled
+        total_frames: Total number of frames in the video
+        video_fps: Original video fps
     """
     video_path = ele["video"]
     if video_path.startswith("file://"):
@@ -208,8 +377,37 @@ def load_video(
     logger.info(
         f"numpy reader: video_path={video_path}, total_frames={total_frames}, video_fps={video_fps}, time={time.time()-st:.3f}s"
     )
-    nframes = smart_nframes(ele, total_frames=total_frames, video_fps=video_fps)
-    indices = np.linspace(0, total_frames - 1, nframes).round().astype(int)
+
+    if use_keyframes:
+        keyframe_indices = extract_keyframes(video_path, video_fps)
+        if keyframe_indices:
+            # Filter to valid range
+            keyframe_indices = [i for i in keyframe_indices if 0 <= i < total_frames]
+            available = len(keyframe_indices)
+            # Cap to max_frames if specified
+            max_frames = ele.get("max_frames")
+            if max_frames and len(keyframe_indices) > max_frames:
+                step = len(keyframe_indices) / max_frames
+                keyframe_indices = [
+                    keyframe_indices[int(i * step)]
+                    for i in range(max_frames)
+                ]
+            # Ensure divisible by FRAME_FACTOR
+            nframes = floor_by_factor(len(keyframe_indices), FRAME_FACTOR)
+            nframes = max(nframes, FRAME_FACTOR)
+            keyframe_indices = keyframe_indices[:nframes]
+            indices = np.array(keyframe_indices, dtype=int)
+            logger.info(
+                f"Using {len(indices)} keyframes (from {available} available)"
+            )
+        else:
+            logger.info("No keyframes found, falling back to uniform sampling")
+            nframes = smart_nframes(ele, total_frames=total_frames, video_fps=video_fps)
+            indices = np.linspace(0, total_frames - 1, nframes).round().astype(int)
+    else:
+        nframes = smart_nframes(ele, total_frames=total_frames, video_fps=video_fps)
+        indices = np.linspace(0, total_frames - 1, nframes).round().astype(int)
+
     frames = []
     for idx in indices:
         cap.set(cv2.CAP_PROP_POS_FRAMES, idx)
@@ -225,15 +423,20 @@ def load_video(
     video_np = np.stack(frames, axis=0)
     # Rearrange to (T, C, H, W)
     video_np = np.transpose(video_np, (0, 3, 1, 2))
-    sample_fps = nframes / max(total_frames, 1e-6) * video_fps
-    return video_np, sample_fps
+    sample_fps = len(frames) / max(total_frames, 1e-6) * video_fps
+    return video_np, sample_fps, indices.tolist(), total_frames, video_fps
 
 
 def fetch_video(
-    ele: dict, image_factor: int = IMAGE_FACTOR, return_video_sample_fps: bool = False
+    ele: dict,
+    image_factor: int = IMAGE_FACTOR,
+    return_video_sample_fps: bool = False,
+    use_keyframes: bool = False,
 ) -> np.ndarray | list[Image.Image]:
     if isinstance(ele["video"], str):
-        video, sample_fps = load_video(ele)
+        video, sample_fps, frame_indices, total_frames, orig_fps = load_video(
+            ele, use_keyframes=use_keyframes
+        )
         nframes, _, height, width = video.shape
         min_pixels = ele.get("min_pixels", VIDEO_MIN_PIXELS)
         total_pixels = ele.get("total_pixels", VIDEO_TOTAL_PIXELS)
@@ -276,7 +479,7 @@ def fetch_video(
             resized_frames.append(resized)
         video = np.stack(resized_frames, axis=0).astype(np.float32)
         if return_video_sample_fps:
-            return video, sample_fps
+            return video, sample_fps, frame_indices, total_frames, orig_fps
         return video
     else:
         # Assume video is provided as a list/tuple of image objects.
@@ -293,7 +496,9 @@ def fetch_video(
         if len(images) < nframes:
             images.extend([images[-1]] * (nframes - len(images)))
         if return_video_sample_fps:
-            return images, process_info.pop("fps", 2.0)
+            fps = process_info.pop("fps", 2.0)
+            frame_indices = list(range(len(images)))
+            return images, fps, frame_indices, len(images), fps
         return images
 
 
@@ -318,6 +523,7 @@ def extract_vision_info(conversations: list[dict] | list[list[dict]]) -> list[di
 def process_vision_info(
     conversations: list[dict] | list[list[dict]],
     return_video_kwargs: bool = False,
+    use_keyframes: bool = False,
 ) -> tuple[
     list[Image.Image] | None, list[np.ndarray | list[Image.Image]] | None, dict | None
 ]:
@@ -326,15 +532,27 @@ def process_vision_info(
     image_inputs = []
     video_inputs = []
     video_sample_fps_list = []
+    video_metadata_list = []
     for vision_info in vision_infos:
         if "image" in vision_info or "image_url" in vision_info:
             image_inputs.append(fetch_image(vision_info))
         elif "video" in vision_info:
-            video_input, video_sample_fps = fetch_video(
-                vision_info, return_video_sample_fps=True
+            video_input, video_sample_fps, frame_indices, total_frames, orig_fps = (
+                fetch_video(
+                    vision_info,
+                    return_video_sample_fps=True,
+                    use_keyframes=use_keyframes,
+                )
             )
             video_sample_fps_list.append(video_sample_fps)
             video_inputs.append(video_input)
+            video_metadata_list.append(
+                {
+                    "total_num_frames": total_frames,
+                    "fps": orig_fps,
+                    "frames_indices": frame_indices,
+                }
+            )
         else:
             raise ValueError("Content must include image, image_url, or video.")
     if len(image_inputs) == 0:
@@ -342,7 +560,10 @@ def process_vision_info(
     if len(video_inputs) == 0:
         video_inputs = None
     if return_video_kwargs:
-        return image_inputs, video_inputs, {"fps": video_sample_fps_list}
+        return image_inputs, video_inputs, {
+            "fps": video_sample_fps_list,
+            "video_metadata": video_metadata_list,
+        }
     return image_inputs, video_inputs
 
 
@@ -429,8 +650,8 @@ def main():
         "--max-pixels",
         type=int,
         nargs=2,
-        default=224 * 224,
-        help="Maximum number of pixels",
+        default=[448, 448],
+        help="Maximum resolution as two integers (height width)",
     )
     parser.add_argument(
         "--max-frames", type=int, default=None, help="Maximum number of frames"
@@ -453,6 +674,24 @@ def main():
         default="mlx-community/Qwen2.5-VL-7B-Instruct-4bit",
         help="Select the model to use",
     )
+    parser.add_argument(
+        "--use-keyframes",
+        action="store_true",
+        default=False,
+        help="Use ffprobe to extract keyframes (I-frames) instead of uniform sampling",
+    )
+    parser.add_argument(
+        "--transcribe",
+        action="store_true",
+        default=False,
+        help="Extract audio transcript with timestamps and include in prompt (requires mlx-whisper)",
+    )
+    parser.add_argument(
+        "--output",
+        type=str,
+        default=None,
+        help="Write generated text to this file",
+    )
     parser.add_argument("--verbose", action="store_false", help="Print verbose output")
 
     args = parser.parse_args()
@@ -472,20 +711,24 @@ def main():
         max_pixels = args.max_pixels
 
     kwargs = {}
+    video_kwargs = {}
     if is_video_model(model):
 
         # Check if video is image or video
         if is_video_file(args.video):
+            video_info = {
+                "type": "video",
+                "video": args.video[0],
+                "max_pixels": max_pixels,
+                "fps": args.fps,
+            }
+            if args.max_frames is not None:
+                video_info["max_frames"] = args.max_frames
             messages = [
                 {
                     "role": "user",
                     "content": [
-                        {
-                            "type": "video",
-                            "video": args.video[0],
-                            "max_pixels": max_pixels,
-                            "fps": args.fps,
-                        },
+                        video_info,
                         {"type": "text", "text": args.prompt},
                     ],
                 }
@@ -501,19 +744,55 @@ def main():
                 }
             ]
 
-        text = processor.apply_chat_template(
-            messages, tokenize=False, add_generation_prompt=True
+        image_inputs, video_inputs, video_kwargs = process_vision_info(
+            messages, return_video_kwargs=True, use_keyframes=args.use_keyframes
         )
-        image_inputs, video_inputs, fps = process_vision_info(messages, True)
 
         if args.max_frames is not None:
             video_inputs = video_inputs[: args.max_frames]
+
+        # Optionally transcribe audio and inject into prompt
+        if args.transcribe and is_video_file(args.video) and video_kwargs.get("video_metadata"):
+            meta = video_kwargs["video_metadata"][0]
+            transcript_text = extract_audio_transcript(
+                args.video[0], meta["frames_indices"], meta["fps"]
+            )
+            if transcript_text:
+                # Inject transcript before the user's question in the message
+                transcript_block = (
+                    f"Audio transcript (with timestamps and frame references):\n"
+                    f"{transcript_text}\n\n"
+                )
+                for msg in messages:
+                    if msg["role"] == "user" and isinstance(msg["content"], list):
+                        for i, part in enumerate(msg["content"]):
+                            if part.get("type") == "text":
+                                msg["content"][i] = {
+                                    "type": "text",
+                                    "text": transcript_block + part["text"],
+                                }
+                                break
+                        break
+
+        text = processor.apply_chat_template(
+            messages, tokenize=False, add_generation_prompt=True
+        )
+
+        # Pass video_metadata to prevent the processor from re-sampling frames
+        processor_kwargs = {}
+        if video_kwargs.get("video_metadata"):
+            processor_kwargs["videos_kwargs"] = {
+                "video_metadata": video_kwargs["video_metadata"],
+                "do_sample_frames": False,
+            }
+
         inputs = processor(
             text=[text],
             images=image_inputs,
             videos=video_inputs,
             padding=True,
             return_tensors="pt",
+            **processor_kwargs,
         )
 
         input_ids = mx.array(inputs["input_ids"])
@@ -559,8 +838,8 @@ def main():
 
         # Configure processor for video frames
         processor.image_processor.size = (
-            args.max_pixels
-            if isinstance(args.max_pixels, tuple)
+            tuple(args.max_pixels)
+            if isinstance(args.max_pixels, (tuple, list))
             else (args.max_pixels, args.max_pixels)
         )
         if hasattr(processor.image_processor, "do_resize"):
@@ -595,6 +874,7 @@ def main():
     kwargs["temperature"] = args.temperature
     kwargs["max_tokens"] = args.max_tokens
 
+    gen_start = time.time()
     response = generate(
         model,
         processor,
@@ -602,9 +882,79 @@ def main():
         verbose=args.verbose,
         **kwargs,
     )
+    gen_elapsed = time.time() - gen_start
 
     if not args.verbose:
         print(response)
+
+    if args.output:
+        # Extract text from GenerationResult if needed
+        if hasattr(response, "text"):
+            response_text = response.text
+        else:
+            response_text = str(response)
+        # Build frontmatter for .md files
+        if args.output.endswith(".md"):
+            video_path = args.video[0]
+            frontmatter_lines = ["---"]
+            frontmatter_lines.append(f"source: \"{video_path}\"")
+            frontmatter_lines.append(f"model: \"{args.model}\"")
+            frontmatter_lines.append(f"max_pixels: {args.max_pixels}")
+            frontmatter_lines.append(f"use_keyframes: {args.use_keyframes}")
+            frontmatter_lines.append(f"transcribe: {args.transcribe}")
+            video_duration = 0.0
+            try:
+                probe = subprocess.run(
+                    [
+                        "ffprobe", "-v", "quiet",
+                        "-show_entries", "format=duration",
+                        "-show_entries", "stream=width,height,r_frame_rate,nb_frames",
+                        "-of", "json",
+                        video_path,
+                    ],
+                    capture_output=True, text=True, timeout=10,
+                )
+                if probe.returncode == 0:
+                    import json as _json
+                    info = _json.loads(probe.stdout)
+                    if info.get("streams"):
+                        s = info["streams"][0]
+                        frontmatter_lines.append(f"width: {s.get('width', '?')}")
+                        frontmatter_lines.append(f"height: {s.get('height', '?')}")
+                        frontmatter_lines.append(f"fps: \"{s.get('r_frame_rate', '?')}\"")
+                        frontmatter_lines.append(f"total_frames: {s.get('nb_frames', '?')}")
+                    if info.get("format"):
+                        video_duration = float(info["format"].get("duration", 0))
+                        mm, ss = divmod(int(video_duration), 60)
+                        frontmatter_lines.append(f"duration: \"{mm}m{ss:02d}s\"")
+            except Exception:
+                pass
+            sampled = 0
+            if video_kwargs.get("video_metadata"):
+                meta = video_kwargs["video_metadata"][0]
+                sampled = len(meta["frames_indices"])
+                frontmatter_lines.append(f"sampled_frames: {sampled}")
+            # Generation stats from GenerationResult
+            if hasattr(response, "prompt_tokens"):
+                frontmatter_lines.append(f"prompt_tokens: {response.prompt_tokens}")
+                frontmatter_lines.append(f"generation_tokens: {response.generation_tokens}")
+                frontmatter_lines.append(f"prompt_tps: \"{response.prompt_tps:.1f}\"")
+                frontmatter_lines.append(f"generation_tps: \"{response.generation_tps:.1f}\"")
+            frontmatter_lines.append(f"generation_time: \"{gen_elapsed:.1f}s\"")
+            if sampled > 0:
+                frontmatter_lines.append(f"time_per_frame: \"{gen_elapsed / sampled:.2f}s\"")
+            if video_duration > 0:
+                frontmatter_lines.append(f"realtime_factor: \"{gen_elapsed / video_duration:.2f}x\"")
+            peak_mem = mx.metal.get_peak_memory() / 1e9
+            if hasattr(response, "peak_memory") and response.peak_memory > peak_mem:
+                peak_mem = response.peak_memory / 1e9
+            frontmatter_lines.append(f"peak_memory: \"{peak_mem:.2f} GB\"")
+            frontmatter_lines.append("---")
+            response_text = "\n".join(frontmatter_lines) + "\n\n" + response_text
+        os.makedirs(os.path.dirname(args.output) or ".", exist_ok=True)
+        with open(args.output, "w") as f:
+            f.write(response_text)
+        logger.info(f"Output written to {args.output}")
 
 
 if __name__ == "__main__":
