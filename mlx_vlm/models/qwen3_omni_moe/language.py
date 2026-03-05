@@ -265,21 +265,25 @@ class Qwen3VLMoEModel(nn.Module):
         visual_pos_masks: Optional[mx.array] = None,
         deepstack_visual_embeds: Optional[mx.array] = None,
         output_hidden_states: bool = False,
+        num_layers=None,
     ):
         if inputs_embeds is None:
             h = self.embed_tokens(inputs)
         else:
             h = inputs_embeds
 
+        layers = self.layers[:num_layers] if num_layers is not None else self.layers
         if cache is None:
-            cache = [None] * len(self.layers)
+            cache = [None] * len(layers)
+        else:
+            cache = cache[:len(layers)]
 
         if mask is None:
             mask = create_attention_mask(h, cache)
 
         all_hidden_states = [] if output_hidden_states else None
 
-        for layer_idx, (layer, c) in enumerate(zip(self.layers, cache)):
+        for layer_idx, (layer, c) in enumerate(zip(layers, cache)):
             if output_hidden_states:
                 all_hidden_states.append(h)
             h = layer(h, mask, c, position_ids)
@@ -504,6 +508,7 @@ class LanguageModel(nn.Module):
         cache=None,
         visual_pos_masks: Optional[mx.array] = None,
         deepstack_visual_embeds: Optional[mx.array] = None,
+        num_layers=None,
         **kwargs,
     ):
 
@@ -568,6 +573,7 @@ class LanguageModel(nn.Module):
             visual_pos_masks=visual_pos_masks,
             deepstack_visual_embeds=deepstack_visual_embeds,
             output_hidden_states=output_hidden_states,
+            num_layers=num_layers,
         )
 
         if output_hidden_states:

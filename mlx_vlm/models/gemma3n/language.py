@@ -492,8 +492,11 @@ class Gemma3Model(nn.Module):
 
         per_layer_inputs = self.project_per_layer_inputs(h, per_layer_inputs)
 
+        layers = self.layers[:num_layers] if num_layers is not None else self.layers
         if cache is None:
-            cache = [None] * len(self.layers)
+            cache = [None] * len(layers)
+        else:
+            cache = cache[:len(layers)]
 
         if mask is None:
             full_mask = create_attention_mask(
@@ -594,10 +597,12 @@ class LanguageModel(nn.Module):
         inputs_embeds: Optional[mx.array] = None,
         mask: Optional[mx.array] = None,
         cache=None,
+        num_layers=None,
         **kwargs,
     ):
         out = self.model(
-            inputs, inputs_embeds=inputs_embeds, mask=mask, cache=cache, **kwargs
+            inputs, inputs_embeds=inputs_embeds, mask=mask, cache=cache, **kwargs,
+            num_layers=num_layers,
         )
         out = self.model.embed_tokens.as_linear(out)
         if self.final_logit_softcapping is not None:

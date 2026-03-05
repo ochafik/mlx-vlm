@@ -365,19 +365,23 @@ class Qwen3_5Model(nn.Module):
         mask: Optional[mx.array] = None,
         cache=None,
         position_ids: Optional[mx.array] = None,
+        num_layers=None,
     ):
         if inputs_embeds is None:
             h = self.embed_tokens(inputs)
         else:
             h = inputs_embeds
 
+        layers = self.layers[:num_layers] if num_layers is not None else self.layers
         if cache is None:
-            cache = [None] * len(self.layers)
+            cache = [None] * len(layers)
+        else:
+            cache = cache[:len(layers)]
 
         fa_mask = create_attention_mask(h, cache[self.fa_idx])
         ssm_mask = create_ssm_mask(h, cache[self.ssm_idx])
 
-        for layer, c in zip(self.layers, cache):
+        for layer, c in zip(layers, cache):
             mask = ssm_mask if layer.is_linear else fa_mask
             h = layer(h, mask, c, position_ids)
 
@@ -569,6 +573,7 @@ class LanguageModel(nn.Module):
         inputs_embeds: Optional[mx.array] = None,
         mask: Optional[mx.array] = None,
         cache=None,
+        num_layers=None,
         **kwargs,
     ):
         position_ids = kwargs.pop("position_ids", None)
@@ -643,6 +648,7 @@ class LanguageModel(nn.Module):
             cache=cache,
             inputs_embeds=inputs_embeds,
             position_ids=position_ids,
+            num_layers=num_layers,
         )
         if self.args.tie_word_embeddings:
             out = self.model.embed_tokens.as_linear(out)

@@ -477,6 +477,7 @@ class DeepseekV2Model(nn.Module):
         mask: Optional[mx.array] = None,
         inputs_embeds: Optional[mx.array] = None,
         cache: Optional[Any] = None,
+        num_layers=None,
     ) -> mx.array:
 
         if inputs_embeds is None:
@@ -484,12 +485,15 @@ class DeepseekV2Model(nn.Module):
         else:
             h = inputs_embeds
 
+        layers = self.layers[:num_layers] if num_layers is not None else self.layers
         if cache is None:
-            cache = [None] * len(self.layers)
+            cache = [None] * len(layers)
+        else:
+            cache = cache[:len(layers)]
 
         mask = create_attention_mask(h, cache[0])
 
-        for layer, c in zip(self.layers, cache):
+        for layer, c in zip(layers, cache):
             h = layer(h, mask, c)
 
         return self.norm(h)
@@ -509,9 +513,10 @@ class LanguageModel(nn.Module):
         inputs_embeds: Optional[mx.array] = None,
         mask: Optional[mx.array] = None,
         cache: Optional[Any] = None,
+        num_layers=None,
         **kwargs,
     ):
-        out = self.model(inputs, mask=mask, inputs_embeds=inputs_embeds, cache=cache)
+        out = self.model(inputs, mask=mask, inputs_embeds=inputs_embeds, cache=cache, num_layers=num_layers)
         out = self.lm_head(out)
         return LanguageModelOutput(logits=out)
 

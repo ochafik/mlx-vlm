@@ -190,9 +190,10 @@ class LanguageModel(nn.Module):
         inputs_embeds: Optional[mx.array] = None,
         mask: Optional[mx.array] = None,
         cache: Optional[list[KVCache]] = None,
+        num_layers=None,
         **kwargs,
     ) -> LanguageModelOutput:
-        hidden_states = self.model(inputs, inputs_embeds, mask, cache)
+        hidden_states = self.model(inputs, inputs_embeds, mask, cache, num_layers=num_layers)
         logits = self.lm_head(hidden_states)
         return LanguageModelOutput(logits=logits)
 

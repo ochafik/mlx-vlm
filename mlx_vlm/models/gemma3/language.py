@@ -193,6 +193,7 @@ class Gemma3Model(nn.Module):
         inputs_embeds: mx.array = None,
         mask: mx.array = None,
         cache=None,
+        num_layers=None,
     ):
         if inputs_embeds is None:
             h = self.embed_tokens(inputs)
@@ -201,8 +202,11 @@ class Gemma3Model(nn.Module):
 
         h *= mx.array(self.config.hidden_size**0.5, mx.bfloat16).astype(h.dtype)
 
+        layers = self.layers[:num_layers] if num_layers is not None else self.layers
         if cache is None:
-            cache = [None] * len(self.layers)
+            cache = [None] * len(layers)
+        else:
+            cache = cache[:len(layers)]
 
         if mask is None:
             global_mask = create_attention_mask(
@@ -218,7 +222,7 @@ class Gemma3Model(nn.Module):
             else:
                 sliding_window_mask = None
 
-        for i, (layer, c) in enumerate(zip(self.layers, cache)):
+        for i, (layer, c) in enumerate(zip(layers, cache)):
             is_global = (
                 i % self.sliding_window_pattern == self.sliding_window_pattern - 1
             )
@@ -248,9 +252,10 @@ class LanguageModel(nn.Module):
         inputs_embeds: Optional[mx.array] = None,
         mask: Optional[mx.array] = None,
         cache=None,
+        num_layers=None,
         **kwargs,
     ):
-        out = self.model(inputs, inputs_embeds=inputs_embeds, mask=mask, cache=cache)
+        out = self.model(inputs, inputs_embeds=inputs_embeds, mask=mask, cache=cache, num_layers=num_layers)
         out = self.lm_head(out)
         return LanguageModelOutput(logits=out)
 

@@ -137,20 +137,24 @@ class CohereModel(nn.Module):
         inputs_embeds: mx.array = None,
         mask: mx.array = None,
         cache=None,
+        num_layers=None,
     ):
         if inputs_embeds is None:
             h = self.embed_tokens(inputs)
         else:
             h = inputs_embeds
 
+        layers = self.layers[:num_layers] if num_layers is not None else self.layers
         if cache is None:
-            cache = [None] * len(self.layers)
+            cache = [None] * len(layers)
+        else:
+            cache = cache[:len(layers)]
 
         if mask is None:
             j = self.config.sliding_window_pattern
             mask = create_attention_mask(h, cache[j - 1 : j])
 
-        for layer, c in zip(self.layers, cache):
+        for layer, c in zip(layers, cache):
             h = layer(h, mask, c)
 
         return self.norm(h)
@@ -169,8 +173,9 @@ class LanguageModel(nn.Module):
         inputs_embeds: mx.array = None,
         mask: mx.array = None,
         cache=None,
+        num_layers=None,
     ):
-        out = self.model(inputs, inputs_embeds, mask, cache)
+        out = self.model(inputs, inputs_embeds, mask, cache, num_layers=num_layers)
         out = self.model.embed_tokens.as_linear(out)
         out = out * self.model.config.logit_scale
         return LanguageModelOutput(logits=out)

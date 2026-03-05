@@ -574,6 +574,7 @@ class LanguageModel(nn.Module):
         inputs_embeds: Optional[mx.array] = None,
         mask: Optional[mx.array] = None,
         cache=None,
+        num_layers=None,
         **kwargs,
     ):
 
@@ -645,7 +646,8 @@ class LanguageModel(nn.Module):
                 )
 
         out = self.model(
-            inputs, cache=cache, inputs_embeds=inputs_embeds, position_ids=position_ids
+            inputs, cache=cache, inputs_embeds=inputs_embeds, position_ids=position_ids,
+            num_layers=num_layers,
         )
 
         out = self.lm_head(out)

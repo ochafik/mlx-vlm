@@ -235,7 +235,7 @@ class Florence2Encoder(nn.Module):
         ]
         self.layernorm_embedding = nn.LayerNorm(embed_dim)
 
-    def __call__(self, input_ids=None, inputs_embeds=None, attention_mask=None):
+    def __call__(self, input_ids=None, inputs_embeds=None, attention_mask=None, num_layers=None):
 
         if inputs_embeds is None:
             inputs_embeds = self.embed_tokens(input_ids)
@@ -291,6 +291,7 @@ class Florence2Decoder(nn.Module):
         cross_attn_head_mask=None,
         inputs_embeds=None,
         cache=None,
+        num_layers=None,
     ):
         if input_ids is not None and inputs_embeds is not None:
             raise ValueError(
@@ -432,6 +433,7 @@ class LanguageModel(nn.Module):
         decoder_attention_mask=None,
         encoder_outputs=None,
         cache=None,
+        num_layers=None,
         **kwargs,
     ):
         cross_attention_states = kwargs.get("cross_attention_states", None)
@@ -459,6 +461,7 @@ class LanguageModel(nn.Module):
             decoder_attention_mask,
             encoder_outputs,
             cache,
+            num_layers=num_layers,
         )
         out = self.lm_head(decoder_outputs)
         return LanguageModelOutput(

@@ -129,6 +129,7 @@ class Llama(nn.Module):
         inputs_embeds: Optional[mx.array] = None,
         mask: Optional[mx.array] = None,
         cache=None,
+        num_layers=None,
     ):
         # for passing merged input embeddings
         if inputs_embeds is None:
@@ -136,13 +137,16 @@ class Llama(nn.Module):
         else:
             h = inputs_embeds
 
+        layers = self.layers[:num_layers] if num_layers is not None else self.layers
         if cache is None:
-            cache = [None] * len(self.layers)
+            cache = [None] * len(layers)
+        else:
+            cache = cache[:len(layers)]
 
         if mask is None:
             mask = create_attention_mask(h, cache)
 
-        for layer, c in zip(self.layers, cache):
+        for layer, c in zip(layers, cache):
             h = layer(h, mask, c)
 
         return self.norm(h)
@@ -166,9 +170,10 @@ class LanguageModel(nn.Module):
         inputs_embeds=None,
         mask: Optional[mx.array] = None,
         cache=None,
+        num_layers=None,
         **kwargs,
     ):
-        out = self.model(inputs, mask=mask, cache=cache, inputs_embeds=inputs_embeds)
+        out = self.model(inputs, mask=mask, cache=cache, inputs_embeds=inputs_embeds, num_layers=num_layers)
         logits = self.lm_head(out)
         return LanguageModelOutput(logits=logits)
 

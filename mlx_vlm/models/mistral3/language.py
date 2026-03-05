@@ -165,14 +165,18 @@ class Ministral3(nn.Module):
         inputs: mx.array,
         cache=None,
         inputs_embeds: Optional[mx.array] = None,
+        num_layers=None,
     ):
         if inputs_embeds is not None:
             h = inputs_embeds
         else:
             h = self.embed_tokens(inputs)
 
+        layers = self.layers[:num_layers] if num_layers is not None else self.layers
         if cache is None:
-            cache = [None] * len(self.layers)
+            cache = [None] * len(layers)
+        else:
+            cache = cache[:len(layers)]
 
         cache_offset = 0
         if cache[0] is not None:
@@ -222,9 +226,10 @@ class LanguageModel(nn.Module):
         inputs: mx.array,
         cache=None,
         inputs_embeds: Optional[mx.array] = None,
+        num_layers=None,
         **kwargs,
     ):
-        out = self.model(inputs=inputs, cache=cache, inputs_embeds=inputs_embeds)
+        out = self.model(inputs=inputs, cache=cache, inputs_embeds=inputs_embeds, num_layers=num_layers)
         if self.config.tie_word_embeddings:
             out = self.model.embed_tokens.as_linear(out)
         else:

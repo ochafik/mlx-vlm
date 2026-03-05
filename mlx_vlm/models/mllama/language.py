@@ -278,6 +278,7 @@ class MllamaTextModel(nn.Module):
         full_text_row_masked_out_mask: Optional[mx.array] = None,
         inputs_embeds: Optional[mx.array] = None,
         cache: Optional[KVCache] = None,
+        num_layers=None,
     ) -> mx.array:
         # Prioritize inputs_embeds if provided
         if inputs_embeds is not None:
@@ -294,13 +295,16 @@ class MllamaTextModel(nn.Module):
 
         hidden_states = inputs_embeds
 
+        layers = self.layers[:num_layers] if num_layers is not None else self.layers
         if cache is None:
-            cache = [None] * len(self.layers)
+            cache = [None] * len(layers)
+        else:
+            cache = cache[:len(layers)]
 
         if mask is None:
             mask = create_attention_mask(hidden_states, cache)
 
-        for idx, (decoder_layer, c) in enumerate(zip(self.layers, cache)):
+        for idx, (decoder_layer, c) in enumerate(zip(layers, cache)):
             if idx in self.config.cross_attention_layers:
                 layer_outputs = decoder_layer(
                     hidden_states,
@@ -338,6 +342,7 @@ class LanguageModel(nn.Module):
         cross_attention_states: Optional[mx.array] = None,
         cross_attention_mask: Optional[mx.array] = None,
         full_text_row_masked_out_mask: Optional[mx.array] = None,
+        num_layers=None,
         **kwargs,
     ) -> Tuple[mx.array, Optional[mx.array]]:
 
@@ -349,6 +354,7 @@ class LanguageModel(nn.Module):
             full_text_row_masked_out_mask=full_text_row_masked_out_mask,
             inputs_embeds=inputs_embeds,
             cache=cache,
+            num_layers=num_layers,
         )
 
         logits = self.lm_head(hidden_states)

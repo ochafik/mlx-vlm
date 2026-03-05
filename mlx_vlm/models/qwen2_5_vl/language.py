@@ -235,19 +235,23 @@ class Qwen2Model(nn.Module):
         mask: Optional[mx.array] = None,
         cache=None,
         position_ids: Optional[mx.array] = None,
+        num_layers=None,
     ):
         if inputs_embeds is None:
             h = self.embed_tokens(inputs)
         else:
             h = inputs_embeds
 
+        layers = self.layers[:num_layers] if num_layers is not None else self.layers
         if cache is None:
-            cache = [None] * len(self.layers)
+            cache = [None] * len(layers)
+        else:
+            cache = cache[:len(layers)]
 
         if mask is None:
             mask = create_attention_mask(h, cache)
 
-        for layer, c in zip(self.layers, cache):
+        for layer, c in zip(layers, cache):
             h = layer(h, mask, c, position_ids)
 
         return self.norm(h)
@@ -449,6 +453,7 @@ class LanguageModel(nn.Module):
         inputs_embeds: Optional[mx.array] = None,
         mask: Optional[mx.array] = None,
         cache=None,
+        num_layers=None,
         **kwargs,
     ):
 
@@ -520,7 +525,8 @@ class LanguageModel(nn.Module):
                 )
 
         out = self.model(
-            inputs, cache=cache, inputs_embeds=inputs_embeds, position_ids=position_ids
+            inputs, cache=cache, inputs_embeds=inputs_embeds, position_ids=position_ids,
+            num_layers=num_layers,
         )
         if self.args.tie_word_embeddings:
             out = self.model.embed_tokens.as_linear(out)

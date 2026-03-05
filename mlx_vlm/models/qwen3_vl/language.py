@@ -245,18 +245,22 @@ class Qwen3VLModel(nn.Module):
         # args for deepstack
         visual_pos_masks: Optional[mx.array] = None,
         deepstack_visual_embeds: Optional[mx.array] = None,
+        num_layers=None,
     ):
         if inputs_embeds is None:
             h = self.embed_tokens(inputs)
         else:
             h = inputs_embeds
 
+        layers = self.layers[:num_layers] if num_layers is not None else self.layers
         if cache is None:
-            cache = [None] * len(self.layers)
+            cache = [None] * len(layers)
+        else:
+            cache = cache[:len(layers)]
 
         if mask is None:
             mask = create_attention_mask(h, cache)
-        for layer_idx, (layer, c) in enumerate(zip(self.layers, cache)):
+        for layer_idx, (layer, c) in enumerate(zip(layers, cache)):
             h = layer(h, mask, c, position_ids)
             # Add deepstack visual embeds
             # add visual features to the hidden states of first several layers
@@ -497,6 +501,7 @@ class LanguageModel(nn.Module):
         # args for deepstack
         visual_pos_masks: Optional[mx.array] = None,
         deepstack_visual_embeds: Optional[mx.array] = None,
+        num_layers=None,
         **kwargs,
     ):
         # Slicing visual_pos_masks when prefilling
@@ -577,6 +582,7 @@ class LanguageModel(nn.Module):
             position_ids=position_ids,
             visual_pos_masks=visual_pos_masks,
             deepstack_visual_embeds=deepstack_visual_embeds,
+            num_layers=num_layers,
         )
         if self.args.tie_word_embeddings:
             out = self.model.embed_tokens.as_linear(out)

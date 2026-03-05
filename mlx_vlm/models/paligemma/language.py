@@ -217,6 +217,7 @@ class GemmaModel(nn.Module):
         inputs_embeds: Optional[mx.array] = None,
         mask: Optional[mx.array] = None,
         cache=None,
+        num_layers=None,
     ):
         # for passing merged input embeddings
         if inputs_embeds is None:
@@ -227,8 +228,11 @@ class GemmaModel(nn.Module):
         normalizer = mx.array(self.config.hidden_size**0.5, dtype=h.dtype)
         h = h * normalizer
 
+        layers = self.layers[:num_layers] if num_layers is not None else self.layers
         if cache is None:
-            cache = [None] * len(self.layers)
+            cache = [None] * len(layers)
+        else:
+            cache = cache[:len(layers)]
 
         use_bidirectional = bool(
             getattr(self.config, "use_bidirectional_attention", False)
@@ -240,7 +244,7 @@ class GemmaModel(nn.Module):
             # For causal decoding, rebuild the mask against current cache length.
             mask = create_attention_mask(h, cache[0], return_array=True)
 
-        for layer, c in zip(self.layers, cache):
+        for layer, c in zip(layers, cache):
             h = layer(h, mask, c)
 
         return self.norm(h)
@@ -265,9 +269,10 @@ class LanguageModel(nn.Module):
         inputs_embeds: Optional[mx.array] = None,
         mask: Optional[mx.array] = None,
         cache=None,
+        num_layers=None,
         **kwargs,
     ):
-        out = self.model(inputs, mask=mask, cache=cache, inputs_embeds=inputs_embeds)
+        out = self.model(inputs, mask=mask, cache=cache, inputs_embeds=inputs_embeds, num_layers=num_layers)
         out = self.model.embed_tokens.as_linear(out)
 
         if self.model_type == "gemma2":

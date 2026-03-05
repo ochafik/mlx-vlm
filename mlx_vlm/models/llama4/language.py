@@ -227,6 +227,7 @@ class LlamaModel(nn.Module):
         input_embeds: mx.array = None,
         mask: mx.array = None,
         cache=None,
+        num_layers=None,
     ):
         if input_embeds is None:
             h = self.embed_tokens(input_ids)
@@ -251,10 +252,13 @@ class LlamaModel(nn.Module):
             h.shape[1], self.config.attention_chunk_size, start, offset
         )
 
+        layers = self.layers[:num_layers] if num_layers is not None else self.layers
         if cache is None:
-            cache = [None] * len(self.layers)
+            cache = [None] * len(layers)
+        else:
+            cache = cache[:len(layers)]
 
-        for idx, (layer, c) in enumerate(zip(self.layers, cache)):
+        for idx, (layer, c) in enumerate(zip(layers, cache)):
             use_chunked_attention = (idx + 1) % 4 != 0
             if use_chunked_attention:
                 local_mask = chunk_mask
@@ -281,6 +285,7 @@ class LanguageModel(nn.Module):
         inputs_embeds: mx.array = None,
         mask: mx.array = None,
         cache=None,
+        num_layers=None,
         **kwargs,
     ):
         out = self.model(
@@ -288,6 +293,7 @@ class LanguageModel(nn.Module):
             input_embeds=inputs_embeds,
             mask=mask,
             cache=cache,
+            num_layers=num_layers,
         )
         out = self.lm_head(out)
         return LanguageModelOutput(logits=out)

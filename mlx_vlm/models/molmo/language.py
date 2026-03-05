@@ -185,9 +185,10 @@ class LanguageModel(nn.Module):
         inputs_embeds: Optional[mx.array] = None,
         mask: Optional[mx.array] = None,
         cache: Optional[KVCache] = None,
+        num_layers=None,
         **kwargs,
     ) -> LanguageModelOutput:
-        outputs = self.model(inputs, inputs_embeds, mask, cache)
+        outputs = self.model(inputs, inputs_embeds, mask, cache, num_layers=num_layers)
         return outputs
 
     @staticmethod

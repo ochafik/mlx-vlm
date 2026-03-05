@@ -423,9 +423,10 @@ class LanguageModel(nn.Module):
         inputs_embeds: Optional[mx.array] = None,
         cache: Optional[Any] = None,
         mask: Optional[mx.array] = None,
+        num_layers=None,
         **kwargs,  # Accept and ignore extra kwargs like image_grid_hws
     ):
-        out = self.model(inputs, inputs_embeds=inputs_embeds, cache=cache, mask=mask)
+        out = self.model(inputs, inputs_embeds=inputs_embeds, cache=cache, mask=mask, num_layers=num_layers)
         out = self.lm_head(out)
         return LanguageModelOutput(logits=out)
 

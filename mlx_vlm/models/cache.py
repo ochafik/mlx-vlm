@@ -10,6 +10,7 @@ from mlx_lm.models.cache import (
     KVCache,
     RotatingKVCache,
     _BaseCache,
+    trim_prompt_cache,
 )
 
 

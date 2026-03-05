@@ -122,6 +122,7 @@ class LanguageModel(nn.Module):
         inputs_embeds: Optional[mx.array] = None,
         mask: Optional[mx.array] = None,
         cache=None,
+        num_layers=None,
         **kwargs,
     ):
         # for passing merged input embeddings
@@ -130,13 +131,16 @@ class LanguageModel(nn.Module):
         else:
             h = inputs_embeds.astype(self.norm.weight.dtype)
 
+        layers = self.layers[:num_layers] if num_layers is not None else self.layers
         if cache is None:
-            cache = [None] * len(self.layers)
+            cache = [None] * len(layers)
+        else:
+            cache = cache[:len(layers)]
 
         if mask is None:
             mask = create_attention_mask(h, cache)
 
-        for layer, c in zip(self.layers, cache):
+        for layer, c in zip(layers, cache):
             h = layer(h, mask, c)
 
         logits = self.lm_head(self.norm(h))

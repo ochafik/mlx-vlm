@@ -250,6 +250,7 @@ class LanguageModel(nn.Module):
         inputs_embeds: Optional[mx.array] = None,
         mask: Optional[mx.array] = None,
         cache: Optional[List[KVCache]] = None,
+        num_layers=None,
         **kwargs,
     ) -> LanguageModelOutput:
         if inputs_embeds is None:
@@ -258,13 +259,16 @@ class LanguageModel(nn.Module):
             x = inputs_embeds
 
         # Initialize cache if needed
+        layers = self.layers[:num_layers] if num_layers is not None else self.layers
         if cache is None:
-            cache = [None] * len(self.layers)
+            cache = [None] * len(layers)
+        else:
+            cache = cache[:len(layers)]
 
         # Create causal attention mask
         mask = create_attention_mask(x, cache)
 
-        for i, layer in enumerate(self.layers):
+        for i, layer in enumerate(layers):
             x = layer(x, mask=mask, cache=cache[i])
 
         hidden_states = self.ln_f(x)
