@@ -560,39 +560,29 @@ def self_speculative_generate_step(
             else:
                 return _process_and_sample(None, logits.squeeze(0))
 
-    # Check if caches are fully trimmable (KV-only models) or have non-trimmable
-    # entries (hybrid models like Qwen3.5 with ArraysCache for linear attention).
-    # Non-trimmable caches require sequential verification instead of batch.
-    _cache_is_trimmable = all(c.is_trimmable() for c in verify_cache)
-
-    def _trim_trimmable_entries(cache_list, n):
-        """Trim only trimmable cache entries (KVCache), skip non-trimmable (ArraysCache)."""
-        if n <= 0:
-            return
-        for c in cache_list:
-            if c.is_trimmable():
-                c.trim(n)
+    # Check if caches have non-trimmable entries (hybrid models like Qwen3.5
+    # with ArraysCache for linear attention). These need save/restore for rewind.
+    _has_non_trimmable = not all(c.is_trimmable() for c in verify_cache)
 
     def _rewind_cache(num_draft, num_accept):
-        if _cache_is_trimmable:
-            cache.trim_prompt_cache(verify_cache, num_draft - num_accept)
-            cache.trim_prompt_cache(draft_cache, max(num_draft - num_accept - 1, 0))
-        else:
-            # For non-trimmable caches, only trim KVCache entries.
-            # ArraysCache state is handled by save/restore in the draft loop
-            # and by sequential verify (which only processes accepted tokens).
-            _trim_trimmable_entries(
-                verify_cache, num_draft - num_accept
-            )
-            _trim_trimmable_entries(
-                draft_cache, max(num_draft - num_accept - 1, 0)
-            )
+        """Trim trimmable cache entries (KVCache). Non-trimmable entries
+        are handled by save/restore when _has_non_trimmable is True."""
+        n_trim_verify = num_draft - num_accept
+        n_trim_draft = max(num_draft - num_accept - 1, 0)
+        if n_trim_verify > 0:
+            for c in verify_cache:
+                if c.is_trimmable():
+                    c.trim(n_trim_verify)
+        if n_trim_draft > 0:
+            for c in draft_cache:
+                if c.is_trimmable():
+                    c.trim(n_trim_draft)
 
-    def _save_non_trimmable_state(cache_list):
-        """Save state of non-trimmable cache entries for rollback.
+    def _save_cache_state(cache_list):
+        """Save full cache state for rollback (both trimmable and non-trimmable).
 
-        Copies arrays and evaluates them immediately to prevent
-        lazy-evaluation corruption when the model later modifies the cache.
+        For non-trimmable entries (ArraysCache): copies arrays eagerly.
+        For trimmable entries (KVCache): saves offset for trim-based restore.
         """
         saved = {}
         arrays_to_eval = []
@@ -608,15 +598,16 @@ def self_speculative_generate_step(
                             arrays_to_eval.append(copy)
                         else:
                             copies.append(s)
-                    saved[i] = copies
+                    saved[i] = ("arrays", copies)
         if arrays_to_eval:
             mx.eval(arrays_to_eval)
         return saved
 
-    def _restore_non_trimmable_state(cache_list, saved):
-        """Restore saved state for non-trimmable cache entries."""
-        for i, state in saved.items():
-            cache_list[i].state = state
+    def _restore_cache_state(cache_list, saved):
+        """Restore saved cache state."""
+        for i, (kind, state) in saved.items():
+            if kind == "arrays":
+                cache_list[i].state = state
 
     def _draft_generate(y, num_draft):
         if num_draft == 0:
@@ -763,8 +754,9 @@ def self_speculative_generate_step(
         while True:
             num_draft = min(max_tokens - ntoks, _adaptive_draft)
 
-            if num_draft > 0 and not _cache_is_trimmable:
-                _draft_saved = _save_non_trimmable_state(draft_cache)
+            if num_draft > 0 and _has_non_trimmable:
+                _verify_saved = _save_cache_state(verify_cache)
+                _draft_saved = _save_cache_state(draft_cache)
 
             draft_tokens = _draft_generate(draft_y, num_draft)
 
@@ -777,8 +769,8 @@ def self_speculative_generate_step(
                 yield verify_tok.item(), verify_lp, False
                 y = verify_tok
                 draft_y = y
-            elif _cache_is_trimmable:
-                # Batch verify: process all tokens at once (fast logits)
+            else:
+                # Batch verify: process all draft tokens at once
                 if prev_tokens is not None:
                     prev_tokens = prev_tokens[
                         : prev_tokens.size - y.size - num_draft + 1
@@ -788,6 +780,7 @@ def self_speculative_generate_step(
                     all_tokens[None], verify_cache, num_draft + 1
                 )
                 mx.eval(tokens, draft_tokens)
+                y_prev_item = y.item()
                 draft_tokens = draft_tokens.tolist()
                 tokens = tokens.tolist()
                 n = 0
@@ -813,61 +806,37 @@ def self_speculative_generate_step(
                         )
                     if prev_tokens is not None:
                         prev_tokens = prev_tokens[: -max(num_draft - n, 1)]
-                    _rewind_cache(num_draft, n)
-            else:
-                # Sequential verify for non-trimmable caches (hybrid models
-                # with ArraysCache). Batch verify + replay would produce
-                # numerical drift in GatedDeltaNet's recurrent state.
-                mx.eval(draft_tokens)
-                draft_tokens_list = draft_tokens.tolist()
 
-                verify_tok, verify_lp = _lm_step(y[None], verify_cache)
-                mx.eval(verify_tok)
-
-                n = 0
-                while n < num_draft:
-                    vt = verify_tok.item()
-                    dt = draft_tokens_list[n]
-                    if vt != dt:
-                        break
-                    n += 1
-                    ntoks += 1
-                    yield vt, verify_lp, True
-                    if ntoks == max_tokens:
-                        break
-                    if n < num_draft:
-                        verify_tok, verify_lp = _lm_step(
-                            mx.array([[dt]], mx.uint32), verify_cache
-                        )
-                        mx.eval(verify_tok)
-
-                if ntoks < max_tokens:
-                    if n == num_draft:
-                        verify_tok, verify_lp = _lm_step(
-                            mx.array([[draft_tokens_list[-1]]], mx.uint32),
-                            verify_cache,
-                        )
-                        mx.eval(verify_tok)
-                    ntoks += 1
-                    yield verify_tok.item(), verify_lp, False
-                    tokens = draft_tokens_list[:n] + [verify_tok.item()]
-                draft_tokens = draft_tokens_list
-
-                if ntoks < max_tokens:
-                    y = mx.array([tokens[n]], mx.uint32)
-                    draft_y = y
-                    if n == num_draft:
-                        draft_y = mx.concatenate(
-                            [mx.array(draft_tokens[-1:], mx.uint32), draft_y]
-                        )
-                    if prev_tokens is not None:
-                        prev_tokens = prev_tokens[: -max(num_draft - n, 1)]
-                    # Sequential verify: verify_cache is correct (only processed
-                    # accepted tokens). Just rewind draft cache.
-                    _restore_non_trimmable_state(draft_cache, _draft_saved)
-                    _trim_trimmable_entries(
-                        draft_cache, max(num_draft - n - 1, 0)
-                    )
+                    if _has_non_trimmable:
+                        if n == num_draft:
+                            # All drafts accepted. Draft cache hasn't seen
+                            # the last draft token (it was output, not input).
+                            # Feed it now to keep ArraysCache in sync with KV.
+                            catchup = mx.array(draft_tokens[-1:], mx.uint32)
+                            _lm_step(
+                                catchup[None], draft_cache,
+                                num_layers=early_exit_layer,
+                            )
+                            draft_y = y  # single token, not [last_draft, bonus]
+                        else:
+                            # Partial acceptance — restore state, replay
+                            _restore_cache_state(verify_cache, _verify_saved)
+                            _restore_cache_state(draft_cache, _draft_saved)
+                            for c in verify_cache:
+                                if c.is_trimmable():
+                                    c.trim(num_draft + 1)
+                            for c in draft_cache:
+                                if c.is_trimmable():
+                                    c.trim(num_draft)
+                            replay_ids = [y_prev_item] + draft_tokens[:n]
+                            replay = mx.array([replay_ids], mx.uint32)
+                            _lm_step(replay, verify_cache, len(replay_ids))
+                            _lm_step(
+                                replay, draft_cache, len(replay_ids),
+                                num_layers=early_exit_layer,
+                            )
+                    else:
+                        _rewind_cache(num_draft, n)
 
             if ntoks == max_tokens:
                 break
@@ -877,24 +846,27 @@ def self_speculative_generate_step(
                 _accept_history = ((_accept_history << 1) | (1 if n > 0 else 0)) & 0xFF
                 _draft_cycle_count = min(_draft_cycle_count + 1, 8)
                 if _draft_cycle_count >= 2 and _accept_history == 0:
-                    # No acceptances in last 2+ cycles — stop drafting
                     _adaptive_draft = 0
                     _baseline_count = 0
                 elif n > 0:
-                    # Had some acceptance — reset probe interval
                     _probe_interval = 32
             else:
-                # Periodically probe with 1 draft to check if acceptance improved
                 _baseline_count += 1
                 if _baseline_count >= _probe_interval:
-                    _adaptive_draft = 1  # probe with single draft token
+                    _adaptive_draft = 1
                     _draft_cycle_count = 0
                     _accept_history = 0
                     _baseline_count = 0
                     _probe_interval = min(_probe_interval * 2, 256)
     finally:
-        if _cache_is_trimmable and num_draft > 0:
-            _rewind_cache(num_draft, n)
+        if num_draft > 0:
+            if _has_non_trimmable:
+                _restore_cache_state(verify_cache, _verify_saved)
+                for c in verify_cache:
+                    if c.is_trimmable():
+                        c.trim(num_draft + 1)
+            else:
+                _rewind_cache(num_draft, n)
 
 
 def speculative_generate_step(
@@ -1118,17 +1090,22 @@ def speculative_generate_step(
     # Yield the first generated token
     yield y.item(), logprobs_first, False
 
-    # Check if caches are fully trimmable
-    _cache_is_trimmable = all(c.is_trimmable() for c in model_cache)
+    # Check if caches have non-trimmable entries (hybrid models)
+    _has_non_trimmable = not all(c.is_trimmable() for c in model_cache)
 
-    def _trim_trimmable_entries(cache_list, n):
-        if n <= 0:
-            return
-        for c in cache_list:
-            if c.is_trimmable():
-                c.trim(n)
+    def _rewind_cache(num_draft, num_accept):
+        n_trim_verify = num_draft - num_accept
+        n_trim_draft = max(num_draft - num_accept - 1, 0)
+        if n_trim_verify > 0:
+            for c in model_cache:
+                if c.is_trimmable():
+                    c.trim(n_trim_verify)
+        if n_trim_draft > 0:
+            for c in draft_cache:
+                if c.is_trimmable():
+                    c.trim(n_trim_draft)
 
-    def _save_non_trimmable_state(cache_list):
+    def _save_cache_state(cache_list):
         saved = {}
         arrays_to_eval = []
         for i, c in enumerate(cache_list):
@@ -1143,14 +1120,24 @@ def speculative_generate_step(
                             arrays_to_eval.append(copy)
                         else:
                             copies.append(s)
-                    saved[i] = copies
+                    saved[i] = ("arrays", copies)
         if arrays_to_eval:
             mx.eval(arrays_to_eval)
         return saved
 
-    def _restore_non_trimmable_state(cache_list, saved):
-        for i, state in saved.items():
-            cache_list[i].state = state
+    def _restore_cache_state(cache_list, saved):
+        for i, (kind, state) in saved.items():
+            if kind == "arrays":
+                cache_list[i].state = state
+
+    def _update_step_kwargs(outputs):
+        nonlocal model_step_kwargs
+        if outputs.cross_attention_states is not None:
+            model_step_kwargs = {
+                "cross_attention_states": outputs.cross_attention_states
+            }
+        elif outputs.encoder_outputs is not None:
+            model_step_kwargs = {"encoder_outputs": outputs.encoder_outputs}
 
     ntoks = 1
     num_draft = 0
@@ -1164,12 +1151,16 @@ def speculative_generate_step(
     _probe_interval = 32
     _adaptive_draft = num_draft_tokens
 
+    import os
+    _spec_debug = os.environ.get("SPEC_DEBUG", "")
+
     try:
         while True:
             num_draft = min(max_tokens - ntoks, _adaptive_draft)
 
-            if num_draft > 0 and not _cache_is_trimmable:
-                _draft_saved = _save_non_trimmable_state(draft_cache)
+            if num_draft > 0 and _has_non_trimmable:
+                _verify_saved = _save_cache_state(model_cache)
+                _draft_saved = _save_cache_state(draft_cache)
 
             draft_tokens = _draft_generate(draft_y, num_draft)
 
@@ -1179,22 +1170,15 @@ def speculative_generate_step(
                     language_model, model_cache, y[None],
                     model_step_kwargs, 1,
                 )
-                if verify_outputs.cross_attention_states is not None:
-                    model_step_kwargs = {
-                        "cross_attention_states": verify_outputs.cross_attention_states
-                    }
-                elif verify_outputs.encoder_outputs is not None:
-                    model_step_kwargs = {
-                        "encoder_outputs": verify_outputs.encoder_outputs
-                    }
+                _update_step_kwargs(verify_outputs)
                 mx.eval(verify_tok)
                 n = 0
                 ntoks += 1
                 yield verify_tok.item(), verify_lp, False
                 y = verify_tok
                 draft_y = y
-            elif _cache_is_trimmable:
-                # Batch verify: process all tokens at once
+            else:
+                # Batch verify: process all draft tokens at once
                 if prev_tokens is not None:
                     prev_tokens = prev_tokens[
                         : prev_tokens.size - y.size - num_draft + 1
@@ -1204,16 +1188,10 @@ def speculative_generate_step(
                     language_model, model_cache, all_tokens[None],
                     model_step_kwargs, num_draft + 1,
                 )
-                if verify_outputs.cross_attention_states is not None:
-                    model_step_kwargs = {
-                        "cross_attention_states": verify_outputs.cross_attention_states
-                    }
-                elif verify_outputs.encoder_outputs is not None:
-                    model_step_kwargs = {
-                        "encoder_outputs": verify_outputs.encoder_outputs
-                    }
+                _update_step_kwargs(verify_outputs)
 
                 mx.eval(tokens, draft_tokens)
+                y_prev_item = y.item()
                 draft_tokens = draft_tokens.tolist()
                 tokens = tokens.tolist()
                 n = 0
@@ -1230,66 +1208,18 @@ def speculative_generate_step(
                     ntoks += 1
                     yield tokens[n], logprobs[n], False
 
-                if ntoks < max_tokens:
-                    y = mx.array([tokens[n]], mx.uint32)
-                    draft_y = y
-                    if n == num_draft:
-                        draft_y = mx.concatenate(
-                            [mx.array(draft_tokens[-1:], mx.uint32), draft_y]
-                        )
-                    if prev_tokens is not None:
-                        prev_tokens = prev_tokens[: -max(num_draft - n, 1)]
-                    _rewind_cache(num_draft, n)
-            else:
-                # Sequential verify for non-trimmable caches (hybrid models).
-                mx.eval(draft_tokens)
-                draft_tokens_list = draft_tokens.tolist()
-
-                verify_tok, verify_lp, verify_outputs = _step(
-                    language_model, model_cache, y[None],
-                    model_step_kwargs, 1,
-                )
-                if verify_outputs.cross_attention_states is not None:
-                    model_step_kwargs = {
-                        "cross_attention_states": verify_outputs.cross_attention_states
-                    }
-                elif verify_outputs.encoder_outputs is not None:
-                    model_step_kwargs = {
-                        "encoder_outputs": verify_outputs.encoder_outputs
-                    }
-                mx.eval(verify_tok)
-
-                n = 0
-                while n < num_draft:
-                    vt = verify_tok.item()
-                    dt = draft_tokens_list[n]
-                    if vt != dt:
-                        break
-                    n += 1
-                    ntoks += 1
-                    yield vt, verify_lp, True
-                    if ntoks == max_tokens:
-                        break
-                    if n < num_draft:
-                        verify_tok, verify_lp, verify_outputs = _step(
-                            language_model, model_cache,
-                            mx.array([[dt]], mx.uint32),
-                            model_step_kwargs, 1,
-                        )
-                        mx.eval(verify_tok)
-
-                if ntoks < max_tokens:
-                    if n == num_draft:
-                        verify_tok, verify_lp, verify_outputs = _step(
-                            language_model, model_cache,
-                            mx.array([[draft_tokens_list[-1]]], mx.uint32),
-                            model_step_kwargs, 1,
-                        )
-                        mx.eval(verify_tok)
-                    ntoks += 1
-                    yield verify_tok.item(), verify_lp, False
-                    tokens = draft_tokens_list[:n] + [verify_tok.item()]
-                draft_tokens = draft_tokens_list
+                if _spec_debug:
+                    _fa_idx = getattr(language_model, 'model', None)
+                    _fa_idx = getattr(_fa_idx, 'fa_idx', None) if _fa_idx else None
+                    _v_off = model_cache[_fa_idx].offset if _fa_idx is not None else '?'
+                    _d_fa = getattr(draft_language_model, 'model', None)
+                    _d_fa = getattr(_d_fa, 'fa_idx', None) if _d_fa else None
+                    _d_off = draft_cache[_d_fa].offset if _d_fa is not None else '?'
+                    print(f"  [SPEC] ntoks={ntoks} n={n}/{num_draft} "
+                          f"v_off={_v_off} d_off={_d_off} "
+                          f"draft_y_len={draft_y.size} "
+                          f"y_prev={y_prev_item} "
+                          f"tokens={tokens[:n+1]} draft={draft_tokens[:n+1]}")
 
                 if ntoks < max_tokens:
                     y = mx.array([tokens[n]], mx.uint32)
@@ -1300,12 +1230,40 @@ def speculative_generate_step(
                         )
                     if prev_tokens is not None:
                         prev_tokens = prev_tokens[: -max(num_draft - n, 1)]
-                    # Sequential verify: model_cache is correct (only processed
-                    # accepted tokens). Just rewind draft cache.
-                    _restore_non_trimmable_state(draft_cache, _draft_saved)
-                    _trim_trimmable_entries(
-                        draft_cache, max(num_draft - n - 1, 0)
-                    )
+
+                    if _has_non_trimmable:
+                        if n == num_draft:
+                            # All drafts accepted. Draft cache hasn't seen
+                            # the last draft token. Feed it to sync.
+                            catchup = mx.array(draft_tokens[-1:], mx.uint32)
+                            _step(
+                                draft_language_model, draft_cache,
+                                catchup[None], draft_step_kwargs,
+                            )
+                            draft_y = y  # single token, not [last_draft, bonus]
+                            if _spec_debug:
+                                print(f"    [CATCHUP] fed {draft_tokens[-1]} to draft")
+                        else:
+                            _restore_cache_state(model_cache, _verify_saved)
+                            _restore_cache_state(draft_cache, _draft_saved)
+                            for c in model_cache:
+                                if c.is_trimmable():
+                                    c.trim(num_draft + 1)
+                            for c in draft_cache:
+                                if c.is_trimmable():
+                                    c.trim(num_draft)
+                            replay_ids = [y_prev_item] + draft_tokens[:n]
+                            replay = mx.array([replay_ids], mx.uint32)
+                            _step(language_model, model_cache, replay,
+                                  model_step_kwargs, len(replay_ids))
+                            _step(draft_language_model, draft_cache, replay,
+                                  draft_step_kwargs, len(replay_ids))
+                            if _spec_debug:
+                                _v_off2 = model_cache[_fa_idx].offset if _fa_idx is not None else '?'
+                                _d_off2 = draft_cache[_d_fa].offset if _d_fa is not None else '?'
+                                print(f"    [REPLAY] {replay_ids} v_off={_v_off2} d_off={_d_off2}")
+                    else:
+                        _rewind_cache(num_draft, n)
 
             if ntoks == max_tokens:
                 break
@@ -1328,8 +1286,14 @@ def speculative_generate_step(
                     _baseline_count = 0
                     _probe_interval = min(_probe_interval * 2, 256)
     finally:
-        if _cache_is_trimmable and num_draft > 0:
-            _rewind_cache(num_draft, n)
+        if num_draft > 0:
+            if _has_non_trimmable:
+                _restore_cache_state(model_cache, _verify_saved)
+                for c in model_cache:
+                    if c.is_trimmable():
+                        c.trim(num_draft + 1)
+            else:
+                _rewind_cache(num_draft, n)
 
 
 def stream_generate(

@@ -290,6 +290,15 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         ]
 
         state = cache[1] if cache else None
+        # Initialize recurrent state in float32 for numerical stability.
+        # The Metal kernel computes in float32 internally for single-token
+        # steps, but bfloat16 state causes batch vs sequential divergence
+        # which breaks speculative decoding's batch verify.
+        if state is None:
+            state = mx.zeros(
+                (B, self.num_v_heads, self.head_v_dim, self.head_k_dim),
+                dtype=mx.float32,
+            )
         inv_scale = k.shape[-1] ** -0.5
         q = (inv_scale**2) * mx.fast.rms_norm(q, None, 1e-6)
         k = inv_scale * mx.fast.rms_norm(k, None, 1e-6)
